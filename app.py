@@ -23,10 +23,10 @@ Run:
 
 import io
 import os
-import smtplib
+import base64
+import requests
 from dotenv import load_dotenv
 load_dotenv()
-from email.message import EmailMessage
 from datetime import datetime, timezone
 
 from flask import Flask, render_template, request, jsonify
@@ -43,11 +43,11 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------
 # Configuration (read from environment variables — nothing hardcoded)
 # ---------------------------------------------------------------------
-SMTP_HOST = os.environ.get("SMTP_HOST", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASS = os.environ.get("SMTP_PASS", "")
-FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER)
+# Resend (https://resend.com) sends email over their HTTPS API instead
+# of raw SMTP — this is what lets it work on Render's free tier, which
+# blocks outbound traffic on SMTP ports 25/465/587.
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "onboarding@resend.dev")
 FROM_NAME = os.environ.get("FROM_NAME", "Patient Coordination")
 # Optional: also BCC every submission to your own clinic inbox
 BCC_EMAIL = os.environ.get("BCC_EMAIL", "")
@@ -59,6 +59,7 @@ REQUIRED_FIELDS = [
     "currency", "package_amount",
 ]
 
+# Colors pulled straight from the HTML form's CSS so the PDF matches it
 NAVY = colors.HexColor("#0d1f3c")
 DARK_RED = colors.HexColor("#8b0000")
 ACCENT_RED = colors.HexColor("#c0392b")
@@ -92,6 +93,7 @@ class GradientBar(Flowable):
         self.text = text
         self.font_size = font_size
         self.left_pad = left_pad
+        # bottom_border = (color, thickness) or None
         self.bottom_border = bottom_border
 
     def wrap(self, availWidth, availHeight):
@@ -146,10 +148,10 @@ def build_pdf(data: dict) -> bytes:
     )
 
     PAD = [
-        ("LEFTPADDING",   (0,0), (-1,-1), 0),
-        ("RIGHTPADDING",  (0,0), (-1,-1), 0),
-        ("TOPPADDING",    (0,0), (-1,-1), 0),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 0),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+        ("TOPPADDING",    (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
     ]
 
     def section_bar(title):
@@ -173,6 +175,7 @@ def build_pdf(data: dict) -> bytes:
         return wrap
 
     def row2(pairs):
+        # pairs: list of (label, value) or (label, value, readonly_bool)
         cells = [field(p[0], p[1], HALF, p[2] if len(p) == 3 else False) for p in pairs]
         t = Table([cells], colWidths=[HALF, HALF], spaceBefore=5)
         t.setStyle(TableStyle([*PAD, ("LEFTPADDING", (1, 0), (1, 0), 6)]))
@@ -192,6 +195,7 @@ def build_pdf(data: dict) -> bytes:
         t.setStyle(TableStyle(PAD))
         return t
 
+    # Header bar — same navy→red gradient with the red accent line under it
     header = GradientBar(W, 34, "Patient Information Form", font_size=15,
                           left_pad=12, bottom_border=(ACCENT_RED, 3))
 
@@ -238,41 +242,50 @@ def build_pdf(data: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------
-# Email sending (plain smtplib — works with Gmail App Passwords,
-# Outlook, or any SMTP server you already have credentials for)
+# Email sending via Resend's HTTPS API (not raw SMTP)
 # ---------------------------------------------------------------------
+RESEND_ENDPOINT = "https://api.resend.com/emails"
+
+
 def send_email_with_pdf(to_email: str, patient_name: str, pdf_bytes: bytes):
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+    if not RESEND_API_KEY:
         raise RuntimeError(
-            "SMTP is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS "
-            "environment variables before sending email."
+            "RESEND_API_KEY is not configured. Set it as an environment "
+            "variable before sending email (see resend.com/api-keys)."
         )
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Your Treatment Information — {patient_name}"
-    msg["From"] = f"{FROM_NAME} <{FROM_EMAIL}>"
-    msg["To"] = to_email
-    if BCC_EMAIL:
-        msg["Bcc"] = BCC_EMAIL
-
-    msg.set_content(
-        f"Dear {patient_name},\n\n"
-        "Please find attached your treatment information document.\n\n"
-        "If any of the details are incorrect, please reply to this email "
-        "and let us know.\n\n"
-        f"Best regards,\n{FROM_NAME}"
-    )
-
     safe_name = "".join(c for c in patient_name if c.isalnum() or c in " _-").strip() or "patient"
-    msg.add_attachment(
-        pdf_bytes, maintype="application", subtype="pdf",
-        filename=f"patient_{safe_name}.pdf",
-    )
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
+    payload = {
+        "from": f"{FROM_NAME} <{FROM_EMAIL}>",
+        "to": [to_email],
+        "subject": f"Your Treatment Information — {patient_name}",
+        "text": (
+            f"Dear {patient_name},\n\n"
+            "Please find attached your treatment information document.\n\n"
+            "If any of the details are incorrect, please reply to this email "
+            "and let us know.\n\n"
+            f"Best regards,\n{FROM_NAME}"
+        ),
+        "attachments": [
+            {"filename": f"patient_{safe_name}.pdf", "content": pdf_b64}
+        ],
+    }
+    if BCC_EMAIL:
+        payload["bcc"] = [BCC_EMAIL]
+
+    resp = requests.post(
+        RESEND_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Resend API error {resp.status_code}: {resp.text}")
 
 
 # ---------------------------------------------------------------------
